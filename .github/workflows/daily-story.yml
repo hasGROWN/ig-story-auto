@@ -1,0 +1,58 @@
+name: daily-instagram-story
+
+# 毎日 JST 10:00（= UTC 01:00）に実行。
+# 手動実行（workflow_dispatch）で臨時にも回せる。
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # レンダリング画像を published ブランチへ push するため
+
+jobs:
+  post-story:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Render today's story PNG
+        id: render
+        run: |
+          node src/render.mjs
+          # 休業日など画像が作られなかった場合は後続をスキップする
+          if [ -f out/story.png ]; then echo "post=yes" >> "$GITHUB_OUTPUT"; else echo "post=no" >> "$GITHUB_OUTPUT"; echo "画像なし（休業日など）→ 投稿スキップ"; fi
+
+      - name: Publish PNG to a public URL (immutable commit on published branch)
+        id: publish
+        if: steps.render.outputs.post == 'yes'
+        run: |
+          OWNER_REPO="${{ github.repository }}"
+          mkdir -p published
+          cp out/story.png published/story.png
+          git config user.name  "story-bot"
+          git config user.email "story-bot@users.noreply.github.com"
+          git fetch origin published || true
+          git checkout -B published
+          git add -f published/story.png
+          git commit -m "story image $(date -u +%FT%TZ)" || echo "no changes"
+          git push -f origin published
+          SHA=$(git rev-parse HEAD)
+          echo "image_url=https://raw.githubusercontent.com/${OWNER_REPO}/${SHA}/published/story.png" >> "$GITHUB_OUTPUT"
+
+      - name: Post to Instagram Stories
+        if: steps.render.outputs.post == 'yes'
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IMAGE_URL: ${{ steps.publish.outputs.image_url }}
+        run: node src/post.mjs
