@@ -1,10 +1,13 @@
 name: daily-instagram-story
 
-# 毎日 JST 10:00（= UTC 01:00）に実行。
-# 手動実行（workflow_dispatch）で臨時にも回せる。
+# 投稿の主役は「外部cron(cron-job.org) → workflow_dispatch」で JST 9:30 ちょうどに実行。
+# 下の GitHub schedule は「万一 9:30 が失敗/未実行だった日のバックアップ」。
+# 主役(9:30)の少し後に発火させるため JST 9:40 目標（= UTC 00:40）。
+# GitHubの定時は遅れることがあるので実際はもっと後になりうるが、いずれにせよ9:30の後 → 通常は二重投稿ガードでスキップ。
+# 手動実行（workflow_dispatch）でも回せる（cron-job.org もこれを叩いている）。
 on:
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '40 0 * * *'
   workflow_dispatch:
 
 permissions:
@@ -32,9 +35,24 @@ jobs:
           # 休業日など画像が作られなかった場合は後続をスキップする
           if [ -f out/story.png ]; then echo "post=yes" >> "$GITHUB_OUTPUT"; else echo "post=no" >> "$GITHUB_OUTPUT"; echo "画像なし（休業日など）→ 投稿スキップ"; fi
 
+      # 二重投稿ガード：published ブランチの last_posted.txt を見て、今日(JST)もう投稿済みなら以降を全部スキップ
+      - name: Skip if already posted today
+        id: dup
+        if: steps.render.outputs.post == 'yes'
+        run: |
+          git fetch origin published >/dev/null 2>&1 || true
+          LAST=$(git show origin/published:last_posted.txt 2>/dev/null || echo "")
+          TODAY=$(TZ=Asia/Tokyo date +%F)
+          if [ "$LAST" = "$TODAY" ]; then
+            echo "already=yes" >> "$GITHUB_OUTPUT"
+            echo "本日($TODAY)は投稿済み → スキップ（二重投稿防止）"
+          else
+            echo "already=no" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish PNG to a public URL (immutable commit on published branch)
         id: publish
-        if: steps.render.outputs.post == 'yes'
+        if: steps.render.outputs.post == 'yes' && steps.dup.outputs.already != 'yes'
         run: |
           OWNER_REPO="${{ github.repository }}"
           mkdir -p published
@@ -50,9 +68,21 @@ jobs:
           echo "image_url=https://raw.githubusercontent.com/${OWNER_REPO}/${SHA}/published/story.png" >> "$GITHUB_OUTPUT"
 
       - name: Post to Instagram Stories
-        if: steps.render.outputs.post == 'yes'
+        if: steps.render.outputs.post == 'yes' && steps.dup.outputs.already != 'yes'
         env:
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IMAGE_URL: ${{ steps.publish.outputs.image_url }}
         run: node src/post.mjs
+
+      # 投稿が成功したときだけ「今日投稿した」記録を残す（失敗時は記録せず、同日中の再試行を許可）
+      - name: Record posted date (dup guard)
+        if: steps.render.outputs.post == 'yes' && steps.dup.outputs.already != 'yes'
+        run: |
+          TODAY=$(TZ=Asia/Tokyo date +%F)
+          git config user.name  "story-bot"
+          git config user.email "story-bot@users.noreply.github.com"
+          echo "$TODAY" > last_posted.txt
+          git add -f last_posted.txt
+          git commit -m "posted $TODAY" || echo "no changes"
+          git push origin published
